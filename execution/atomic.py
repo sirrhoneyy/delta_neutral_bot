@@ -161,18 +161,30 @@ class AtomicExecutor:
             # Check if both succeeded
             if extended_result.success and tradexyz_result.success:
                 self._current_state = ExecutionState.COMPLETE
-                
+
+                # Use actual fill prices from trade results, fallback to submitted price
+                extended_fill_price = (
+                    extended_result.trade_result.average_price
+                    if extended_result.trade_result and extended_result.trade_result.average_price > 0
+                    else price
+                )
+                tradexyz_fill_price = (
+                    tradexyz_result.trade_result.average_price
+                    if tradexyz_result.trade_result and tradexyz_result.trade_result.average_price > 0
+                    else price
+                )
+
                 trading_logger.position_opened(
                     exchange="Extended",
                     side=extended_side.value,
                     size=size,
-                    entry_price=price,
+                    entry_price=extended_fill_price,
                 )
                 trading_logger.position_opened(
                     exchange="TradeXYZ",
                     side=tradexyz_side.value,
                     size=size,
-                    entry_price=price,
+                    entry_price=tradexyz_fill_price,
                 )
                 
                 return ExecutionResult(

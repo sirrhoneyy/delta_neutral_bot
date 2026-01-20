@@ -332,8 +332,10 @@ class ExtendedExchange(BaseExchange):
             market_name = self.get_market_symbol(symbol) if "-" not in symbol else symbol
             x10_side = X10OrderSide.BUY if side == PositionSide.LONG else X10OrderSide.SELL
 
-            # Map time in force
-            x10_tif = X10TimeInForce.IOC if time_in_force == TimeInForce.IOC else X10TimeInForce.GTC
+            # Use GTT (Good-Till-Time) to ensure orders stay open until filled
+            # IOC orders cancel if they don't fill immediately, which causes issues
+            # X10 SDK supports: GTT, IOC, FOK (no GTC)
+            x10_tif = X10TimeInForce.GTT
 
             # Get market info for precision and price
             market_info = await self.get_market_info(symbol)
@@ -361,11 +363,14 @@ class ExtendedExchange(BaseExchange):
             # Get price if not provided (for market orders, fetch current price)
             order_price = price
             if order_price is None:
-                # Use a price offset for market orders
+                # Use aggressive price offset to ensure fills
+                # For buys: use ask price + slippage, for sells: use bid price - slippage
                 if side == PositionSide.LONG:
-                    order_price = market_info.last_price * 1.01  # 1% above for buy
+                    base_price = market_info.ask_price if market_info.ask_price > 0 else market_info.last_price
+                    order_price = base_price * 1.005  # 0.5% above ask for buy
                 else:
-                    order_price = market_info.last_price * 0.99  # 1% below for sell
+                    base_price = market_info.bid_price if market_info.bid_price > 0 else market_info.last_price
+                    order_price = base_price * 0.995  # 0.5% below bid for sell
 
             # Round price to valid precision
             price_step = market_info.min_price_change
@@ -397,23 +402,64 @@ class ExtendedExchange(BaseExchange):
                 reduce_only=reduce_only,
             )
 
-            # Check response - X10 SDK uses 'success' or check for data presence
-            is_successful = getattr(response, 'success', None) or getattr(response, 'is_success', None) or (response.data is not None)
+            # Check response - X10 SDK returns data even for orders that may not fill
+            has_data = response.data is not None
+
+            # Log detailed response info
+            order_status = None
+            order_id = None
+            if has_data:
+                order_id = str(response.data.id) if hasattr(response.data, 'id') else None
+                order_status = str(response.data.status) if hasattr(response.data, 'status') else None
 
             logger.info(
                 "Extended order response",
                 response_type=type(response).__name__,
-                has_data=response.data is not None,
-                response_attrs=[a for a in dir(response) if not a.startswith('_')],
+                has_data=has_data,
+                order_id=order_id,
+                order_status=order_status,
+                response_error=getattr(response, 'error', None),
             )
 
-            if is_successful and response.data:
+            if has_data and response.data:
+                # Order was accepted - extract fill data if available
+                # Try to get fill price and quantity from the response
+                fill_price = 0.0
+                fill_qty = 0.0
+
+                if hasattr(response.data, 'averagePrice') and response.data.averagePrice:
+                    fill_price = float(response.data.averagePrice)
+                elif hasattr(response.data, 'average_price') and response.data.average_price:
+                    fill_price = float(response.data.average_price)
+                elif hasattr(response.data, 'price') and response.data.price:
+                    # Fallback to order price if no fill price available
+                    fill_price = float(response.data.price)
+                else:
+                    # Use the submitted order price as last resort
+                    fill_price = order_price
+
+                if hasattr(response.data, 'filledQuantity') and response.data.filledQuantity:
+                    fill_qty = float(response.data.filledQuantity)
+                elif hasattr(response.data, 'filled_quantity') and response.data.filled_quantity:
+                    fill_qty = float(response.data.filled_quantity)
+                elif hasattr(response.data, 'executedQuantity') and response.data.executedQuantity:
+                    fill_qty = float(response.data.executedQuantity)
+
+                logger.info(
+                    "Extended order fill info",
+                    fill_price=fill_price,
+                    fill_qty=fill_qty,
+                    order_price=order_price,
+                )
+
                 return TradeResult(
                     success=True,
-                    order_id=str(response.data.id) if hasattr(response.data, 'id') else "unknown",
+                    order_id=order_id or "unknown",
                     external_id=external_id,
                     error_message=None,
                     error_code=None,
+                    filled_quantity=fill_qty,
+                    average_price=fill_price,
                     raw_response=response.data.model_dump() if hasattr(response.data, 'model_dump') else None,
                 )
             else:
