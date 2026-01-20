@@ -53,8 +53,15 @@ class TradeXYZSettings(BaseSettings):
     )
     
     wallet_address: str = Field(default=os.getenv("TRADEXYZ_WALLET_ADDRESS", "0x0"))
+    # Main wallet for balance queries (if using API wallet for signing)
+    main_wallet_address: str = Field(default=os.getenv("TRADEXYZ_MAIN_WALLET_ADDRESS", ""))
     api_secret: SecretStr = Field(default=SecretStr(os.getenv("TRADEXYZ_API_SECRET", "0x0")))
     network: Literal["mainnet", "testnet"] = Field(default="mainnet")
+
+    @property
+    def balance_wallet(self) -> str:
+        """Return the wallet to use for balance queries (main wallet if set, otherwise API wallet)."""
+        return self.main_wallet_address if self.main_wallet_address else self.wallet_address
     
     @property
     def base_url(self) -> str:

@@ -1,6 +1,7 @@
 """Extended Exchange implementation."""
 
 import asyncio
+from decimal import Decimal
 from typing import Any, Dict, List, Optional
 
 import httpx
@@ -18,6 +19,23 @@ from utils.logging import get_logger
 from utils.timing import get_current_timestamp, get_expiration_timestamp
 from utils.retry import exchange_retry
 from core.randomizer import CryptoRandomizer
+
+# Extended SDK imports (optional - for live trading)
+try:
+    from x10.perpetual.accounts import StarkPerpetualAccount
+    from x10.perpetual.trading_client import PerpetualTradingClient
+    from x10.perpetual.configuration import MAINNET_CONFIG, TESTNET_CONFIG
+    from x10.perpetual.orders import OrderSide as X10OrderSide
+    from x10.perpetual.orders import TimeInForce as X10TimeInForce
+    X10_SDK_AVAILABLE = True
+except ImportError:
+    X10_SDK_AVAILABLE = False
+    StarkPerpetualAccount = None
+    PerpetualTradingClient = None
+    MAINNET_CONFIG = None
+    TESTNET_CONFIG = None
+    X10OrderSide = None
+    X10TimeInForce = None
 
 from .base import (
     BaseExchange,
@@ -56,6 +74,10 @@ class ExtendedExchange(BaseExchange):
         self._cache_timestamp: int = 0
         self._cache_ttl: int = 5000
 
+        # X10 SDK client for live trading
+        self._x10_account: Optional[StarkPerpetualAccount] = None
+        self._x10_client: Optional[PerpetualTradingClient] = None
+
     def __repr__(self) -> str:
         """Safe representation that hides sensitive data."""
         return (
@@ -76,24 +98,55 @@ class ExtendedExchange(BaseExchange):
                 },
                 timeout=30.0,
             )
-            
+
             response = await self._client.get("/api/v1/user/account/info")
-            
+
             if response.status_code == 200:
                 data = response.json()
                 if data.get("status") == "OK":
                     logger.info("Connected to Extended Exchange", account_id=self._account_id)
                     self._connected = True
+
+                    # Initialize X10 SDK for live trading
+                    if not self._simulation:
+                        if not X10_SDK_AVAILABLE:
+                            logger.warning(
+                                "X10 SDK not installed - live trading disabled. "
+                                "Install with: pip install git+https://github.com/x10xchange/python_sdk.git"
+                            )
+                        else:
+                            # Handle both SecretStr and plain str for l2_key
+                            l2_key_value = (
+                                self._l2_key.get_secret_value()
+                                if hasattr(self._l2_key, 'get_secret_value')
+                                else self._l2_key
+                            )
+                            self._x10_account = StarkPerpetualAccount(
+                                vault=self._vault,
+                                private_key=self._stark_private_key.get_secret_value(),
+                                public_key=l2_key_value,
+                                api_key=self._api_key.get_secret_value(),
+                            )
+                            self._x10_client = PerpetualTradingClient(
+                                endpoint_config=MAINNET_CONFIG,
+                                stark_account=self._x10_account,
+                            )
+                            logger.info("X10 SDK initialized for live trading")
+
                     return True
-            
+
             logger.error("Failed to connect to Extended", status=response.status_code)
             return False
-            
+
         except Exception as e:
             logger.error("Extended connection error", error=str(e))
             return False
 
     async def disconnect(self) -> None:
+        if self._x10_client:
+            await self._x10_client.close()
+            self._x10_client = None
+            self._x10_account = None
         if self._client:
             await self._client.aclose()
             self._client = None
@@ -254,15 +307,134 @@ class ExtendedExchange(BaseExchange):
                 error_message=None,
                 error_code=None,
             )
-        
-        # Real order placement would go here
-        return TradeResult(
-            success=False,
-            order_id=None,
-            external_id=external_id,
-            error_message="Live trading not implemented",
-            error_code="NOT_IMPLEMENTED",
-        )
+
+        # Live trading using X10 SDK
+        if not X10_SDK_AVAILABLE:
+            return TradeResult(
+                success=False,
+                order_id=None,
+                external_id=external_id,
+                error_message="X10 SDK not installed. Install with: pip install git+https://github.com/x10xchange/python_sdk.git",
+                error_code="SDK_NOT_INSTALLED",
+            )
+
+        if not self._x10_client:
+            return TradeResult(
+                success=False,
+                order_id=None,
+                external_id=external_id,
+                error_message="X10 SDK not initialized",
+                error_code="SDK_NOT_INITIALIZED",
+            )
+
+        try:
+            # Convert to X10 SDK types
+            market_name = self.get_market_symbol(symbol) if "-" not in symbol else symbol
+            x10_side = X10OrderSide.BUY if side == PositionSide.LONG else X10OrderSide.SELL
+
+            # Map time in force
+            x10_tif = X10TimeInForce.IOC if time_in_force == TimeInForce.IOC else X10TimeInForce.GTC
+
+            # Get market info for precision and price
+            market_info = await self.get_market_info(symbol)
+
+            # Round quantity to valid precision
+            qty_step = market_info.min_order_size_change
+            if qty_step > 0:
+                rounded_qty = float(Decimal(str(quantity)).quantize(
+                    Decimal(str(qty_step)),
+                    rounding='ROUND_DOWN'
+                ))
+            else:
+                rounded_qty = quantity
+
+            # Ensure minimum order size
+            if rounded_qty < market_info.min_order_size:
+                return TradeResult(
+                    success=False,
+                    order_id=None,
+                    external_id=external_id,
+                    error_message=f"Order size {rounded_qty} below minimum {market_info.min_order_size}",
+                    error_code="SIZE_TOO_SMALL",
+                )
+
+            # Get price if not provided (for market orders, fetch current price)
+            order_price = price
+            if order_price is None:
+                # Use a price offset for market orders
+                if side == PositionSide.LONG:
+                    order_price = market_info.last_price * 1.01  # 1% above for buy
+                else:
+                    order_price = market_info.last_price * 0.99  # 1% below for sell
+
+            # Round price to valid precision
+            price_step = market_info.min_price_change
+            if price_step > 0:
+                rounded_price = float(Decimal(str(order_price)).quantize(
+                    Decimal(str(price_step)),
+                    rounding='ROUND_HALF_UP'
+                ))
+            else:
+                rounded_price = round(order_price, 2)
+
+            logger.info(
+                "Extended order params",
+                symbol=market_name,
+                qty=rounded_qty,
+                price=rounded_price,
+                side=x10_side,
+            )
+
+            # Place order via X10 SDK
+            response = await self._x10_client.place_order(
+                market_name=market_name,
+                amount_of_synthetic=Decimal(str(rounded_qty)),
+                price=Decimal(str(rounded_price)),
+                side=x10_side,
+                post_only=post_only,
+                time_in_force=x10_tif,
+                external_id=external_id,
+                reduce_only=reduce_only,
+            )
+
+            # Check response - X10 SDK uses 'success' or check for data presence
+            is_successful = getattr(response, 'success', None) or getattr(response, 'is_success', None) or (response.data is not None)
+
+            logger.info(
+                "Extended order response",
+                response_type=type(response).__name__,
+                has_data=response.data is not None,
+                response_attrs=[a for a in dir(response) if not a.startswith('_')],
+            )
+
+            if is_successful and response.data:
+                return TradeResult(
+                    success=True,
+                    order_id=str(response.data.id) if hasattr(response.data, 'id') else "unknown",
+                    external_id=external_id,
+                    error_message=None,
+                    error_code=None,
+                    raw_response=response.data.model_dump() if hasattr(response.data, 'model_dump') else None,
+                )
+            else:
+                error_msg = getattr(response, 'error', None) or getattr(response, 'message', None) or "Order placement failed"
+                return TradeResult(
+                    success=False,
+                    order_id=None,
+                    external_id=external_id,
+                    error_message=str(error_msg),
+                    error_code="ORDER_FAILED",
+                )
+
+        except Exception as e:
+            logger.error("Extended order placement error", error=str(e))
+            return TradeResult(
+                success=False,
+                order_id=None,
+                external_id=external_id,
+                error_message=str(e),
+                error_code="EXCEPTION",
+            )
 
     async def cancel_order(self, order_id: str) -> bool:
         if self._simulation:
@@ -286,12 +458,30 @@ class ExtendedExchange(BaseExchange):
                 error_message=None,
                 error_code=None,
             )
-        return TradeResult(
-            success=False,
-            order_id=None,
-            external_id=None,
-            error_message="Live trading not implemented",
-            error_code="NOT_IMPLEMENTED",
+
+        # Get current position
+        positions = await self.get_positions(symbol)
+        if not positions:
+            return TradeResult(
+                success=True,
+                order_id=None,
+                external_id=None,
+                error_message="No position to close",
+                error_code=None,
+            )
+
+        position = positions[0]
+        close_qty = quantity or position.size
+
+        # Close by placing opposite order
+        close_side = PositionSide.SHORT if position.side == PositionSide.LONG else PositionSide.LONG
+
+        return await self.place_order(
+            symbol=symbol,
+            side=close_side,
+            quantity=close_qty,
+            order_type=OrderType.MARKET,
+            reduce_only=True,
         )
 
     async def set_leverage(self, symbol: str, leverage: int) -> bool:

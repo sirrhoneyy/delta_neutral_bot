@@ -8,8 +8,8 @@ from decimal import Decimal
 
 import httpx
 from eth_account import Account
-from eth_account.messages import encode_defunct
 import eth_utils
+from hyperliquid.utils.signing import sign_l1_action, get_timestamp_ms
 
 from config.constants import (
     ExchangeName,
@@ -68,6 +68,8 @@ class TradeXYZExchange(BaseExchange):
         self._settings = settings
         self._base_url = settings.base_url
         self._wallet_address = settings.wallet_address
+        # Main wallet for balance/position queries (your actual Hyperliquid account)
+        self._balance_wallet = settings.balance_wallet
         # Keep as SecretStr - only extract at point of use
         self._api_secret = settings.api_secret
 
@@ -82,6 +84,9 @@ class TradeXYZExchange(BaseExchange):
         self._asset_index_map: Dict[str, int] = {}
         self._cache_timestamp: int = 0
         self._cache_ttl: int = 60000  # 60 seconds
+
+        # Network configuration (mainnet vs testnet)
+        self._is_mainnet = "mainnet" in self._base_url or "hyperliquid.xyz" in self._base_url
 
     def __repr__(self) -> str:
         """Safe representation that hides sensitive data."""
@@ -240,7 +245,7 @@ class TradeXYZExchange(BaseExchange):
         """Get account balance information."""
         response = await self._info_request({
             "type": "clearinghouseState",
-            "user": self._wallet_address,
+            "user": self._balance_wallet,  # Use main wallet for balance queries
         })
         
         if not response:
@@ -268,12 +273,12 @@ class TradeXYZExchange(BaseExchange):
         """Get open positions."""
         response = await self._info_request({
             "type": "clearinghouseState",
-            "user": self._wallet_address,
+            "user": self._balance_wallet,  # Use main wallet for position queries
         })
-        
+
         if not response:
             return []
-        
+
         positions = []
         asset_positions = response.get("assetPositions", [])
         
@@ -397,15 +402,35 @@ class TradeXYZExchange(BaseExchange):
         
         # Build order
         is_buy = side == PositionSide.LONG
-        
-        # Round to appropriate decimals
+
+        # Round to appropriate decimals based on Hyperliquid's requirements
         asset_info = self._meta_cache["universe"][asset_idx]
         sz_decimals = int(asset_info.get("szDecimals", 3))
-        px_decimals = int(asset_info.get("pxDecimals", 2))
-        
+
+        # Hyperliquid uses 5 significant figures for price
+        # Price must be rounded to tick size (varies by asset)
+        # For BTC, typical tick is 1.0, for smaller assets it's smaller
         rounded_size = round(quantity, sz_decimals)
-        rounded_price = round(price, px_decimals)
-        
+
+        # Format price with appropriate precision
+        # Hyperliquid requires prices to be multiples of the tick size
+        # For BTC this is typically $1, so we round to whole numbers
+        if asset in ["BTC"]:
+            rounded_price = round(price, 0)  # Round to nearest dollar for BTC
+        elif asset in ["ETH"]:
+            rounded_price = round(price, 1)  # Round to $0.1 for ETH
+        else:
+            rounded_price = round(price, 2)  # Default to cents
+
+        logger.info(
+            "TradeXYZ order params",
+            asset=asset,
+            is_buy=is_buy,
+            size=rounded_size,
+            price=rounded_price,
+            sz_decimals=sz_decimals,
+        )
+
         order_spec = {
             "a": asset_idx,
             "b": is_buy,
@@ -678,25 +703,25 @@ class TradeXYZExchange(BaseExchange):
     
     def _sign_action(self, action: Dict[str, Any], nonce: int) -> Dict[str, str]:
         """
-        Sign an action using EIP-712.
-        
-        Note: This is a simplified implementation. Real signing requires
-        proper EIP-712 typed data structure specific to Hyperliquid.
+        Sign an action using Hyperliquid's EIP-712 signing scheme.
+
+        Uses the official hyperliquid-python-sdk for proper signature generation.
         """
         if not self._account:
             raise RuntimeError("Account not initialized")
-        
-        # Create message hash (simplified - actual implementation needs full EIP-712)
-        message = json.dumps({"action": action, "nonce": nonce}, sort_keys=True)
-        message_hash = encode_defunct(text=message)
-        
-        signed = self._account.sign_message(message_hash)
-        
-        return {
-            "r": hex(signed.r),
-            "s": hex(signed.s),
-            "v": signed.v,
-        }
+
+        # Use official Hyperliquid SDK signing
+        # active_pool=None means no vault, expires_after=None means no expiry
+        signature = sign_l1_action(
+            wallet=self._account,
+            action=action,
+            active_pool=None,
+            nonce=nonce,
+            expires_after=None,
+            is_mainnet=self._is_mainnet,
+        )
+
+        return signature
     
     def _parse_order(self, data: Dict[str, Any]) -> OrderInfo:
         """Parse order data from API response."""
